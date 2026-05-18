@@ -2239,9 +2239,14 @@ struct common_speculative_state_mtp : public common_speculative_state {
         mtp_chain_drafts.clear();
         mtp_chain_probs.clear();
 
-        // Record accepted tokens for repetition detection
-        if (n_accepted > 0) {
-            llama_tokens accepted(batch_tokens.begin(), batch_tokens.begin() + n_accepted);
+        // Record accepted tokens for repetition detection.
+        // batch_tokens = [id_last, draft[0], draft[1], ..., draft[N-1]]
+        // id_last is the context token (already in history from previous round).
+        // n_accepted is the number of tokens from the verification batch that matched
+        // (includes the bonus sampled token), so actual accepted drafts = n_accepted - 1.
+        // Record batch_tokens[1 : n_accepted] = the accepted draft tokens, excluding id_last.
+        if (n_accepted > 1) {
+            llama_tokens accepted(batch_tokens.begin() + 1, batch_tokens.begin() + n_accepted);
             record_accepted(accepted);
         }
 
