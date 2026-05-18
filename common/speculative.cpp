@@ -2067,8 +2067,21 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_tokens mtp_chain_drafts;
     std::vector<float> mtp_chain_probs;
 
+    // Repetition detection: track recent accepted tokens to detect limit cycles
+    static constexpr int RECENT_TOKEN_BUF = 64;
+    std::vector<llama_token> recent_tokens;
+    int recent_pos = 0;
+    int recent_count = 0;
+
+    // Consecutive same-token detection (catches single-token loops like asterisks)
+    llama_token last_draft = LLAMA_TOKEN_NULL;
+    int same_draft_count = 0;
+    static constexpr int SAME_DRAFT_LIMIT = 3; // reject if same token proposed 3+ times in a row
+
     common_speculative_state_mtp(enum common_speculative_type type, llama_context * ctx)
-        : common_speculative_state(type), ctx_tgt(ctx) {}
+        : common_speculative_state(type), ctx_tgt(ctx) {
+        recent_tokens.resize(RECENT_TOKEN_BUF);
+    }
 
     static float top1_prob(const float * logits, int64_t n) {
         float max_val = *std::max_element(logits, logits + n);
@@ -2082,6 +2095,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
     void begin(const llama_tokens & /*prompt*/) override {
         mtp_chain_drafts.clear();
         mtp_chain_probs.clear();
+        recent_pos = 0;
+        recent_count = 0;
+        last_draft = LLAMA_TOKEN_NULL;
+        same_draft_count = 0;
 
         // Pre-populate from context's MTP output if available (not present after prompt eval).
         int64_t vocab = llama_get_mtp_n_vocab(ctx_tgt);
@@ -2114,16 +2131,97 @@ struct common_speculative_state_mtp : public common_speculative_state {
         const float p_min = params.draft.p_min;
 
         if (mtp_draft != LLAMA_TOKEN_NULL && mtp_draft_prob >= p_min) {
+            // Consecutive same-token detection
+            if (mtp_draft == last_draft) {
+                same_draft_count++;
+            } else {
+                last_draft = mtp_draft;
+                same_draft_count = 1;
+            }
+
             result.push_back(mtp_draft);
             const int32_t cap = params.draft.n_max;
             for (size_t i = 0; i < mtp_chain_drafts.size() && (int32_t)result.size() < cap; ++i) {
                 if (mtp_chain_probs[i] < p_min) break;
                 result.push_back(mtp_chain_drafts[i]);
             }
+
+            // Repetition detection: reject if same token proposed repeatedly or draft extends a repeating pattern
+            if (same_draft_count >= SAME_DRAFT_LIMIT || would_repeat(result)) {
+                LOG_DBG("%s: MTP repetition detected (same=%d, repeat=%d), disabling speculation\n",
+                    __func__, same_draft_count, would_repeat(result) ? 1 : 0);
+                result.clear();
+            }
+        } else {
+            // Reset counter when no valid draft
+            last_draft = LLAMA_TOKEN_NULL;
+            same_draft_count = 0;
         }
     }
 
-    void accept(uint16_t /*n_accepted*/) override {}
+    void accept(uint16_t n_accepted) override {
+        // Record accepted tokens for repetition detection
+        // n_accepted includes the bonus sampled token, so actual new tokens = n_accepted - 1
+        // We don't have access to the actual token IDs here, but we can track the count
+        // The actual token recording happens via update_logits which sees batch_tokens
+    }
+
+    void record_accepted(const llama_tokens & tokens) {
+        for (llama_token t : tokens) {
+            recent_tokens[recent_pos % RECENT_TOKEN_BUF] = t;
+            recent_pos++;
+            if (recent_count < RECENT_TOKEN_BUF) recent_count++;
+        }
+    }
+
+    bool would_repeat(const llama_tokens & draft) const {
+        if (recent_count < 8 || draft.empty()) return false;
+
+        // Check 1: if draft tokens match a recent suffix that would create a repeating cycle.
+        int draft_len = (int)draft.size();
+        if (draft_len >= 2) {
+            for (int period = draft_len; period <= recent_count / 2; period++) {
+                bool match = true;
+                for (int d = 0; d < draft_len && match; d++) {
+                    int idx1 = (recent_pos - draft_len + d) % RECENT_TOKEN_BUF;
+                    if (idx1 < 0) idx1 += RECENT_TOKEN_BUF;
+                    int idx2 = (recent_pos - period - draft_len + d) % RECENT_TOKEN_BUF;
+                    if (idx2 < 0) idx2 += RECENT_TOKEN_BUF;
+                    if (recent_tokens[idx1] != recent_tokens[idx2] ||
+                        recent_tokens[idx1] != draft[d]) {
+                        match = false;
+                    }
+                }
+                if (match) return true;
+            }
+        }
+
+        // Check 2: scan recent buffer for repeating period (catches single-token drafts
+        // that are part of a longer phrase-level loop).
+        // Look for a period P where the last 2*P tokens show the pattern repeated.
+        int min_period = 4; // minimum loop period in tokens
+        int max_period = std::min(32, recent_count / 3);
+        for (int period = min_period; period <= max_period; period++) {
+            int mismatches = 0;
+            int checked = 0;
+            // Compare last P tokens with the P tokens before them
+            for (int i = 0; i < period; i++) {
+                int idx1 = (recent_pos - period + i) % RECENT_TOKEN_BUF;
+                if (idx1 < 0) idx1 += RECENT_TOKEN_BUF;
+                int idx2 = (recent_pos - 2 * period + i) % RECENT_TOKEN_BUF;
+                if (idx2 < 0) idx2 += RECENT_TOKEN_BUF;
+                if (recent_tokens[idx1] != recent_tokens[idx2]) {
+                    mismatches++;
+                }
+                checked++;
+            }
+            // Allow ~10% mismatch (punctuation variations, etc.)
+            if (checked > 0 && mismatches * 10 <= checked) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     int32_t n_max(const common_params_speculative & params) const override {
         int64_t vocab = llama_get_mtp_n_vocab(ctx_tgt);
@@ -2140,6 +2238,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
     void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
         mtp_chain_drafts.clear();
         mtp_chain_probs.clear();
+
+        // Record accepted tokens for repetition detection
+        if (n_accepted > 0) {
+            llama_tokens accepted(batch_tokens.begin(), batch_tokens.begin() + n_accepted);
+            record_accepted(accepted);
+        }
 
         int64_t mtp_vocab = llama_get_mtp_n_vocab(ctx);
         if (mtp_vocab <= 0 || n_accepted <= 0) {

@@ -3132,6 +3132,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // Clear MTP KV buffer at start of each decode to prevent cross-pass accumulation.
+    // The base MTP step only needs main KV cache context (via get_attn()), not its own
+    // historical predictions. Accumulated buffer entries create attention distribution
+    // mismatch that degrades MTP predictions and causes token repetition loops.
+    if (cparams.mtp_enabled && mtp_kv.buffer) {
+        mtp_kv.n_used = 0;
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
