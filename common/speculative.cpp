@@ -2175,7 +2175,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 
     bool would_repeat(const llama_tokens & draft) const {
-        if (recent_count < 8 || draft.empty()) return false;
+        if (recent_count < 6 || draft.empty()) return false;
 
         // Check 1: if draft tokens match a recent suffix that would create a repeating cycle.
         int draft_len = (int)draft.size();
@@ -2199,7 +2199,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         // Check 2: scan recent buffer for repeating period (catches single-token drafts
         // that are part of a longer phrase-level loop).
         // Look for a period P where the last 2*P tokens show the pattern repeated.
-        int min_period = 4; // minimum loop period in tokens
+        int min_period = 2; // minimum loop period in tokens (catch 2-token repeats like "foo. foo.")
         int max_period = std::min(32, recent_count / 3);
         for (int period = min_period; period <= max_period; period++) {
             int mismatches = 0;
