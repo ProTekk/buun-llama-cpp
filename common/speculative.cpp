@@ -1301,7 +1301,7 @@ struct common_speculative_impl_suffix : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
     }
 
     bool need_embd() const override {
@@ -1502,7 +1502,7 @@ struct common_speculative_impl_copyspec : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
     }
 
     // incrementally extend index with accepted tokens
@@ -1633,7 +1633,7 @@ struct common_speculative_impl_recycle : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
     }
 
     void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
@@ -2032,7 +2032,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted) override {
+    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted, bool /*is_other*/) override {
         if (n_draft_last > 0) {
             float f_acc = (float) n_accepted / (float) n_draft_last;
             if (f_acc < 0.3f) {
@@ -3168,7 +3168,7 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
             impl->n_acc_drafts++;
             impl->n_acc_tokens += n_accepted;
         }
-        impl->accept(0, n_accepted);
+        impl->accept(0, n_accepted, false);
         impl->n_call_accept++;
     }
 }
@@ -3194,10 +3194,10 @@ void common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq
     }
     for (auto & impl : spec->impls) {
         if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-            auto * mtp = static_cast<common_speculative_state_draft_mtp *>(impl.get());
+            auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
             auto * ctx_dft = mtp->params.ctx_dft;
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
-            mtp->accept(seq_id, n_accepted);
+            mtp->accept(seq_id, n_accepted, false);
         }
     }
 }
