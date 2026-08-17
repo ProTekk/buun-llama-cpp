@@ -77,6 +77,8 @@ test parameters:
                                             (default: mmap)
   -mmp, --mmap <0|1>                        deprecated; use --load-mode
   -dio, --direct-io <0|1>                   deprecated; use --load-mode
+  -mmp, --mmap <0|1>                        (DEPRECATED IN FAVOUR OF --load-mode)
+  -dio, --direct-io <0|1>                   (DEPRECATED IN FAVOUR OF --load-mode)
   -embd, --embeddings <0|1>                 (default: 0)
   -ts, --tensor-split <ts0/ts1/..>          (default: 0)
   -ot --override-tensor <tensor name pattern>=<buffer type>;...
