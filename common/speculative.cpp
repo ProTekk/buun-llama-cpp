@@ -5213,6 +5213,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: return "draft-mtp-adaptive";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
@@ -5551,7 +5552,8 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                        || params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
     const bool external_mtp_sidecar = params.speculative.has_external_mtp_sidecar();
     const bool combined_external_and_mtp = has_draft && spec_mtp && !external_mtp_sidecar;
 
@@ -5721,7 +5723,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         // SUFFIX/RECYCLE/legacy DFLASH remain per-slot. CopySpec is also hosted
         // here when paired with shared multi-seq DFlash2/MTP so both implementations
         // have one owner and one per-sequence acceptance lifecycle.
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 15);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 16);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first

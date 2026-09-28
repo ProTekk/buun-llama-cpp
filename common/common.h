@@ -181,6 +181,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, // Multi-token prediction with adaptive draft depth
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
@@ -335,7 +336,7 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_max = 4; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
     bool n_max_set = false; // true when the user explicitly overrides the draft depth
 
@@ -458,7 +459,8 @@ struct common_params_speculative {
     }
 
     bool uses_mtp_as_primary_drafter() const {
-        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+        return (has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+                has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)) &&
                !has_non_mtp_model_drafter();
     }
 
