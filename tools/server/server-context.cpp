@@ -1776,6 +1776,10 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // per-slot exact p/q verification counters, printed in print_timings
+    uint64_t n_spec_pq_pos = 0;  // draft positions verified with the full q rows
+    uint64_t n_spec_pq_rows = 0; // verification rounds that used any q rows
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -2608,6 +2612,8 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        n_spec_pq_pos = 0;
+        n_spec_pq_rows = 0;
 
         n_predict_max = -1;
 
@@ -3138,6 +3144,12 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            if (n_spec_pq_rows > 0) {
+                const uint64_t n_id = n_draft_total - n_spec_pq_pos;
+                SLT_INF(*this,
+                        "     spec pq = %zu positions verified by p/q (%zu rounds) + %zu by id-match\n",
+                        n_spec_pq_pos, n_spec_pq_rows, n_id);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
 
@@ -22945,6 +22957,10 @@ private:
                         proposal->top_k, proposal->candidate_ids, proposal->q_rows,
                         q_covered, ids);
                     if (accepted_from_proposal) {
+                        // exact p/q positions verified this round; the rest of the
+                        // draft (and any other rounds) were verified by id-match
+                        slot.n_spec_pq_pos += q_covered;
+                        slot.n_spec_pq_rows += 1;
                         SLT_DBG(slot, "verified %zu-token draft with %zu exact q rows\n",
                             slot.spec_draft.size(), q_covered);
                     }
