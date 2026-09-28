@@ -96,6 +96,7 @@ add_library(${TARGET}
     log.cpp
     log.h
     mtp-vocab-qwen27b-balanced.inc
+    mtp-vocab-qwen27b-65k.inc
     mtp-vocab-trim.cpp
     mtp-vocab-trim.h
     ngram-cache.cpp
