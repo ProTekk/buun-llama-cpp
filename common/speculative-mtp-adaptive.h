@@ -9,11 +9,11 @@
 class common_speculative_mtp_adaptive {
 public:
     explicit common_speculative_mtp_adaptive(int minimum, int maximum)
-        : minimum_depth(std::max(1, std::min(minimum, maximum))), cap(maximum) {}
+        : minimum_depth(std::max(1, std::min(minimum, maximum))), maximum_depth(maximum), cap(maximum) {}
 
     int depth() const { return cap; }
 
-    void reset() { *this = common_speculative_mtp_adaptive(minimum_depth, cap); }
+    void reset() { *this = common_speculative_mtp_adaptive(minimum_depth, maximum_depth); }
 
     // Keep a learned depth across requests, but treat the new prefix as an
     // opportunity to recover. Restarting every request at the full depth
@@ -27,7 +27,7 @@ public:
     void accept(int drafted, int accepted, bool other) {
         // Clipped/failed drafts and another implementation's proposals do not
         // measure our selected depth. Duplicate carry refreshes have no draft.
-        if (other || drafted != cap || accepted < 0 || accepted > drafted || minimum_depth == cap) {
+        if (other || drafted != cap || accepted < 0 || accepted > drafted || minimum_depth == maximum_depth) {
             return;
         }
 
@@ -57,6 +57,7 @@ public:
 
 private:
     int minimum_depth;
+    int maximum_depth;
     int cap;
     int attempts = 0;
     int full = 0;
