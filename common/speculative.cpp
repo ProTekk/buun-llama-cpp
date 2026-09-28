@@ -3008,6 +3008,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            // a fresh draft starts a fresh q draw stream (the q sampler has no
+            // token-history state to preserve, only its RNG)
+            if (q_smpls[seq_id]) {
+                common_sampler_reset(q_smpls[seq_id].get());
+            }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, carry, row_bytes);
