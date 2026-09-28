@@ -398,6 +398,7 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+    bool spec_type_set = false; // true when the user explicitly set --spec-type (including none)
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;

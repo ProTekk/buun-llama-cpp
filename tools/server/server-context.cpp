@@ -21,6 +21,7 @@
 #include "common.h"
 #include "common-cache-plan.h"
 #include "mtp-vocab-trim.h"
+#include "spec-defaults.h"
 #include "fit.h"
 #include "gguf.h"
 #include "llama.h"
@@ -9470,6 +9471,12 @@ private:
             vbr_prompt_cache_automatic ||
             vbr_prompt_cache_mode ==
                 common_vbr_prompt_cache_mode::enabled_explicit;
+
+        // A target model that ships a built-in MTP head gets the MTP drafter on by default
+        // (GGUF header probe, no tensor data). Runs before the vocab-trim and DFlash
+        // preflights so the first launch accounts the drafter like an explicit --spec-type
+        // would. An explicit --spec-type (including none) wins.
+        common_speculative_apply_model_default(params_base);
 
         // Qwen-27B external MTP sidecars can derive and reuse a frequency-prior
         // vocabulary-trimmed copy. This runs before fit/placement so the first
