@@ -7923,6 +7923,7 @@ private:
             if (type == COMMON_SPECULATIVE_TYPE_NONE) { continue; }
             if (selected != COMMON_SPECULATIVE_TYPE_NONE ||
                 (type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                 type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE &&
                  type != COMMON_SPECULATIVE_TYPE_DFLASH &&
                  type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) { return {}; }
             selected = type;
@@ -7994,7 +7995,8 @@ private:
         }
         const auto draft_type = active_prefix_draft_type();
         if (!draft_type) { return; }
-        const bool mtp = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        const bool mtp = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                         *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
         const bool dflash = *draft_type == COMMON_SPECULATIVE_TYPE_DFLASH;
         const bool shared_dflash = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
         const bool drafting = mtp || dflash || shared_dflash;
