@@ -43,6 +43,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-mtp-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
@@ -55,7 +56,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE},
     {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
-    {"mtp",           COMMON_SPECULATIVE_TYPE_DRAFT_MTP}
+    {"mtp",           COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"mtp-adaptive",  COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE}
 };
 
 bool common_speculative_mtp_carry_lifecycle::draft_ready() const noexcept {
@@ -2644,11 +2646,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_memory_has_shared_cells(llama_get_memory(ctx_dft));
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
-        adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared && this->params.n_max == 3 &&
-                                   !(adaptive_env && atoi(adaptive_env) == 0);
-        adaptive.assign(n_seq, common_speculative_mtp_adaptive(this->params.n_min));
+        // Adaptive draft depth: selected by the draft-mtp-adaptive type. The
+        // n_max==3 + GGML_MTP_DRAFT_ADAPTIVE probe is superseded by the explicit
+        // type; the fixed draft-mtp path keeps its given n_max untouched.
+        const bool adaptive_type = params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
+        adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared && adaptive_type;
+        adaptive.assign(n_seq, common_speculative_mtp_adaptive(
+                std::max(1, std::min(this->params.n_min_adaptive, this->params.n_max)),
+                this->params.n_max));
         adaptive_last_draft_size.assign(n_seq, 0);
+        if (adaptive_recursive_depth) {
+            SPC_TRC("- adaptive draft depth: min %d, max %d\n",
+                    std::max(1, std::min(this->params.n_min_adaptive, this->params.n_max)),
+                    this->params.n_max);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -5306,6 +5317,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
@@ -5743,6 +5755,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,
                 common_speculative_mtp_context_available(params));
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE,
+                common_speculative_mtp_context_available(params));
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
     }
@@ -5762,6 +5776,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
                 break;
             }
@@ -6670,7 +6688,8 @@ void common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq
         return;
     }
     for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+            impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) {
             auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
             auto * ctx_dft = mtp->params.ctx_dft;
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
@@ -6911,6 +6930,7 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
     if (params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+        params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
         return params.draft.n_min;

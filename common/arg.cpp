@@ -2120,6 +2120,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        const bool adaptive_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
+        if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
+            throw std::invalid_argument("--spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
+        }
+
         params.lr.init();
 
         // DFlash-safe target batch defaults. The drafter's block_size=16 / internal
@@ -5379,6 +5384,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min-adaptive"}, "N",
+        string_format("minimum adaptive MTP draft depth; the depth starts at --spec-draft-n-max and never drops below it (default: %d)", params.speculative.draft.n_min_adaptive),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_min_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
     add_opt(common_arg(
         {"--spec-mtp-vocab-size"}, "N",
         string_format("Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables (default: %u)",

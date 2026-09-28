@@ -9513,7 +9513,8 @@ private:
         const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()
+                            || params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
         const bool has_spec = has_draft || spec_mtp;
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
 
@@ -9693,6 +9694,7 @@ private:
         const bool speculative_target_active =
             params_base.speculative.has_dft() ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) ||
             params_base.speculative.has_model_free_type();
         bool target_uses_rs_plane = false;
         if (speculative_target_active && params_base.speculative.need_n_rs_seq() > 0) {
@@ -10370,7 +10372,8 @@ private:
                     params_base.speculative.draft.ctx_mtp = ctx_mtp.get();
                 }
             }
-        } else if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+        } else if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                || params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)) {
             // no new model load, so we simply report 0.0 and 1.0 progress
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
@@ -19811,6 +19814,7 @@ private:
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
         const bool shared_block_diffusion =
