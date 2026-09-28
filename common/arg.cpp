@@ -5402,11 +5402,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
     add_opt(common_arg(
         {"--spec-mtp-vocab-size"}, "N",
-        string_format("Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables (default: %u)",
+        string_format("Qwen-27B MTP draft vocabulary; 0 disables, 32768 and 65536 select a trim size (default: %u)",
                 params.speculative.draft.mtp_vocab_size),
         [](common_params & params, int value) {
-            if (value != 0 && value != 32768) {
-                throw std::invalid_argument("--spec-mtp-vocab-size must be 0 or 32768");
+            if (value != 0 && value != 32768 && value != 65536) {
+                throw std::invalid_argument("--spec-mtp-vocab-size must be 0, 32768, or 65536");
             }
             params.speculative.draft.mtp_vocab_size = value;
         }
