@@ -1,8 +1,8 @@
 // Generated from the llamAmpere atx_65536 draft-vocabulary list
-(JakeATX/llamAmpere docs/mtp-vocab/atx_65536.txt): 65536 frequency-ranked
-tokens of the Qwen3.8-27B tokenizer (248320 vocab), coding + stem-QA +
-mixed corpora with hard-keep sets. One bit per token: bit i of word w
-selects token w*64+i.
+// (JakeATX/llamAmpere docs/mtp-vocab/atx_65536.txt): 65536 frequency-ranked
+// tokens of the Qwen3.8-27B tokenizer (248320 vocab), coding + stem-QA +
+// mixed corpora with hard-keep sets. One bit per token: bit i of word w
+// selects token w*64+i.
 // Sorted token-ID list SHA-256: f055a5253e10eec938027ac25f6499f76886bcd4e3d3d96fe1038bfb357b1f13.
 // Source file: docs/mtp-vocab/atx_65536.txt (llamAmpere) SHA-256: 8405ff0f8970da24b72d68c9e61fa4309fdcf3719ecc1d7626f0ae8bd2a8e326.
 static constexpr std::array<uint64_t, 3880> QWEN27B_65K_VOCAB = {
