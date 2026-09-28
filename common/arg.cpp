@@ -5327,6 +5327,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_k = kv_cache_type_from_str(value, false);
+            params.speculative.draft.cache_type_k_explicit = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -5340,8 +5341,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.cache_type_v = kv_cache_type_from_str(value, false);
+            params.speculative.draft.cache_type_v_explicit = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--spec-draft-cache-follow"}, "<0|1>",
+        string_format("inherit the main model -ctk/-ctv for the draft KV cache when -ctkd/-ctvd are not set (default: %d)", (int) params.speculative.draft.draft_cache_follow),
+        [](common_params & params, int value) {
+            params.speculative.draft.draft_cache_follow = value != 0;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_FOLLOW"));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {

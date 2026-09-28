@@ -5490,6 +5490,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    if (params_spec.draft_cache_follow) {
+        if (params.vbr_cache_type_k || params.vbr_cache_type_v) {
+            LOG_WRN("speculative: --spec-draft-cache-follow is ignored with a VBR main model KV cache; keeping the static draft KV types\n");
+        } else {
+            if (!params_spec.cache_type_k_explicit) {
+                result.cache_type_k = params.cache_type_k;
+            }
+            if (!params_spec.cache_type_v_explicit) {
+                result.cache_type_v = params.cache_type_v;
+            }
+        }
+    }
     // Drafter caches are small and ephemeral — never arm dynamic VBR for them. The
     // wholesale copy above inherits the base params' default-on VBR flags, and a second
     // dynamic-VBR context trips the one-marker-per-process co-tenancy guard, failing
