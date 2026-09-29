@@ -168,7 +168,7 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
@@ -792,6 +792,22 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     ggml_cuda_fattn_scratch_free(*this);
     ggml_cuda_vbr_transcode_workspace_free(*this);
+
+    // Shared-quantize cache buffers are raw device allocations, not pool memory: the pool frees
+    // strict LIFO and these are taken while transient pool allocations sit below them, so free
+    // order here does not matter.
+    for (const auto & e : q8_cache.entries) {
+        if (e.ptr != nullptr) {
+            ggml_cuda_set_device(e.dev);
+            CUDA_CHECK(cudaFree(e.ptr));
+        }
+    }
+    for (char * ptr : q8_cache.retired) {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+        }
+    }
+    q8_cache.retired.clear();
 
     ggml_cuda_set_device(device);
     for (int * ptr : exl3_int8_counter_storage) {
@@ -8311,6 +8327,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (!cuda_ctx->external_capture) {
         ggml_cuda_wait_uploads(cuda_ctx->stream());
     }
+
+    // New graph eval: invalidate the shared-quantize cache (see q8_cache in common.cuh).
+    cuda_ctx->graph_epoch++;
 
 #if !defined(GGML_USE_HIP)
     // Humming projections in one graph can consume the same activation (for

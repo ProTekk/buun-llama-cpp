@@ -1304,6 +1304,10 @@ struct ggml_cuda_pool {
     virtual void free(void * ptr, size_t size) = 0;
 };
 
+// Plain device allocation (defined in ggml-cuda.cu): used for context-owned persistent buffers
+// that must not go through the strict-LIFO pool.
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+
 template<typename T>
 struct ggml_cuda_pool_alloc {
     ggml_cuda_pool * pool = nullptr;
@@ -1642,6 +1646,37 @@ struct ggml_cuda_q8_activation_storage {
 struct ggml_backend_cuda_context {
     // Conv-state fusion is shared by CUDA and HIP; reset for each graph evaluation.
     std::unordered_set<const ggml_tensor *> precomputed_ssm_convs;
+
+    // Per-graph-eval shared-quantize cache for the mmvq path. Several matvecs in one decode
+    // layer consume the same activation (Q/V/K read attn_norm; the router, fused gate/up and
+    // shared-expert gate read attn_post_norm), and each used to re-quantize it to q8_1. The two
+    // most recent quantizations are kept in persistent device buffers and reused when the same
+    // src1 tensor is seen again in the same graph eval with identical layout. Stream ordering
+    // makes overwrite safe (all consumers of the previous entry are enqueued before the next
+    // quantize runs). A buffer is never freed while in use: a captured graph may still replay
+    // kernels that point at it, so outgrown buffers are retired and freed at teardown.
+    struct q8_cache_entry {
+        char *              ptr  = nullptr;      // raw device memory (not pool), grow-only
+        size_t              cap  = 0;            // usable bytes
+        int                 dev  = -1;           // device the buffer was allocated on
+        const ggml_tensor * src1 = nullptr;      // key: tensor identity ...
+        const void *        data = nullptr;      // ... and its data pointer
+        uint64_t            epoch = 0;           // valid only within this graph eval
+        size_t              size = 0;            // quantized bytes
+        int64_t             ne10_padded = 0;     // layout keys
+        bool                swizzle_iq4 = false; // IQ4_XS swizzled activation rows
+        uint64_t            last_use = 0;        // LRU order
+    };
+
+    struct {
+        q8_cache_entry entries[2];
+        uint64_t       tick = 0;
+        std::vector<char *> retired;             // outgrown buffers, freed at teardown
+    } q8_cache;
+
+    // Incremented at the start of every graph evaluation; keys the q8_cache entries.
+    uint64_t graph_epoch = 1;
+
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

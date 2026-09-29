@@ -2668,6 +2668,70 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+bool ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes) {
+    static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
+    // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
+    return !q8_cache_disabled && q8_bytes <= (1u << 20) && ctx.curr_stream_no == 0;
+}
+
+// The q8_1 layout depends on the weight type only through the IQ4_XS swizzle (quantize_row_q8_1_cuda), so the
+// cache keys on that layout, not on the type.
+static bool ggml_cuda_q8_cache_swizzle(ggml_type type_src0) {
+    return type_src0 == GGML_TYPE_IQ4_XS;
+}
+
+static ggml_backend_cuda_context::q8_cache_entry * ggml_cuda_q8_cache_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+                                                                           ggml_type type_src0, size_t q8_bytes, int64_t ne10_padded) {
+    const bool swizzle = ggml_cuda_q8_cache_swizzle(type_src0);
+    for (auto & e : ctx.q8_cache.entries) {
+        if (e.epoch == ctx.graph_epoch && e.src1 == src1 && e.data == src1->data && e.size == q8_bytes &&
+            e.ne10_padded == ne10_padded && e.swizzle_iq4 == swizzle && e.dev == ctx.device) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                size_t q8_bytes, int64_t ne10_padded) {
+    auto & qc = ctx.q8_cache;
+    ggml_backend_cuda_context::q8_cache_entry * qe = ggml_cuda_q8_cache_find(ctx, src1, type_src0, q8_bytes, ne10_padded);
+    if (qe == nullptr) {
+        // replace an entry from an older graph eval first, else the least recently used one
+        qe = &qc.entries[0];
+        for (auto & e : qc.entries) {
+            if (e.epoch != ctx.graph_epoch) {
+                qe = &e;
+                break;
+            }
+            if (e.last_use < qe->last_use) {
+                qe = &e;
+            }
+        }
+    }
+    qe->last_use = ++qc.tick;
+    if (qe->dev != ctx.device || qe->cap < q8_bytes) {
+        // Never free a buffer here: a CUDA graph captured earlier may still replay
+        // kernels that point at it. Retire it and release everything at context teardown.
+        if (qe->ptr != nullptr) {
+            qc.retired.push_back(qe->ptr);
+        }
+        // Plain device memory, not pool memory: the pool frees strict LIFO, and this
+        // buffer is taken while transient pool allocations sit below it. CUDA graph
+        // capture runs in relaxed mode, which allows cudaMalloc during capture.
+        CUDA_CHECK(ggml_cuda_device_malloc((void **) &qe->ptr, q8_bytes, ctx.device));
+        qe->cap = q8_bytes;
+        qe->dev = ctx.device;
+    }
+    qe->src1        = src1;
+    qe->data        = src1->data;
+    qe->epoch       = ctx.graph_epoch;
+    qe->size        = q8_bytes;
+    qe->ne10_padded = ne10_padded;
+    qe->swizzle_iq4 = ggml_cuda_q8_cache_swizzle(type_src0);
+    return qe->ptr;
+}
+
 static void ggml_cuda_mul_mat_vec_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, float post_scale, bool post_silu,
@@ -2796,6 +2860,26 @@ static void ggml_cuda_mul_mat_vec_q_impl(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+
+    // Shared-quantize cache: reuse an earlier quantization when the same src1 tensor is
+    // consumed again in this graph eval with the same layout (see q8_cache in common.cuh).
+    // The layout depends on src0->type only through the IQ4_XS swizzle. ConvRot, the fp8
+    // marker and FWHT paths use different quantizers and stay uncached, as does MUL_MAT_ID.
+    const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const bool q8_cacheable = !conv_prefix && ids == nullptr && !fp8_marker && !fwht_input &&
+        ggml_cuda_q8_cacheable(ctx, q8_bytes);
+    ggml_backend_cuda_context::q8_cache_entry * qe =
+        q8_cacheable ? ggml_cuda_q8_cache_find(ctx, src1, src0->type, q8_bytes, ne10_padded) : nullptr;
+    char * src1_q8_1_d = nullptr;      // cache buffer to write/read (hit or claim), else nullptr
+    bool q8_hit = false;               // entry already holds this quantization: skip quantize
+    if (qe != nullptr) {
+        qe->last_use = ++ctx.q8_cache.tick;
+        src1_q8_1_d = qe->ptr;
+        q8_hit      = true;
+    } else if (q8_cacheable) {
+        src1_q8_1_d = ggml_cuda_q8_cache_claim(ctx, src1, src0->type, q8_bytes, ne10_padded);
+    }
+
 #if !defined(GGML_USE_HIP)
     if (fp8_marker) {
         GGML_ASSERT(src0->type == GGML_TYPE_F8_E4M3 && !ids && ggml_is_contiguous(src1));
@@ -2810,12 +2894,14 @@ static void ggml_cuda_mul_mat_vec_q_impl(
     if (fwht_input) {
         GGML_ASSERT(!ids && !fp8_marker && ne10 == ne10_padded);
         ggml_cuda_fwht_q8_1(ctx, fwht_input, fwht_signs, src1_q8_1.get());
-    } else {
+    } else if (!q8_hit) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        char * const q8_dst = src1_q8_1_d != nullptr ? src1_q8_1_d : src1_q8_1.get();
+        quantize_row_q8_1_cuda(src1_d, nullptr, q8_dst, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
+    char * const act_q8 = src1_q8_1_d != nullptr ? src1_q8_1_d : src1_q8_1.get();
 
     int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -2857,7 +2943,7 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         fusion_local.conv_state = static_cast<float *>(conv_state->data);
         const auto launch = ggml_cuda_kernel_launch_params(dim3(ne01, 1, 1), dim3(32, 4, 1), 0, stream);
         ggml_cuda_kernel_launch(mul_mat_vec_q<GGML_TYPE_F8_E4M3, 1, true, false, false, 0, false, true>,
-            launch, src0->data, src1_q8_1.get(), static_cast<const int32_t *>(nullptr), fusion_local, dst_d,
+            launch, src0->data, act_q8, static_cast<const int32_t *>(nullptr), fusion_local, dst_d,
             uint32_t(ne00), init_fastdiv_values(1), uint32_t(s01), uint32_t(s11), uint32_t(s1),
             init_fastdiv_values(1), uint32_t(s02), uint32_t(s12), uint32_t(s2),
             init_fastdiv_values(1), uint32_t(s03), uint32_t(s13), uint32_t(s3), uint32_t(0));
@@ -2865,7 +2951,7 @@ static void ggml_cuda_mul_mat_vec_q_impl(
     }
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, act_q8, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
