@@ -15,6 +15,7 @@
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "../src/llama-io.h"
+#include "../src/llama-batch.h"
 
 #include <algorithm>
 #include <cassert>
@@ -411,9 +412,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             common_params_sampling params;
             params.no_perf = false;
             params.top_k = 10;
-            params.samplers = {
-                COMMON_SAMPLER_TYPE_TOP_K,
-            };
+            params.samplers.assign(1, COMMON_SAMPLER_TYPE_TOP_K);
 
             smpl.reset(common_sampler_init(llama_get_model(ctx_dft), params));
         }
@@ -6022,6 +6021,20 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
+}
+
+bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+    if (!spec || batch.size() == 0) {
+        return true;
+    }
+    // Keep the fork's borrowed, reusable hidden-feature batches as the execution
+    // owner. Extended callers materialize metadata once, retaining every sequence
+    // ID and position axis; ordered embedding rows alias the batch's owned bytes.
+    llama_batch view = {};
+    if (!batch.get() || !batch.get()->get_batch(view)) {
+        return false;
+    }
+    return common_speculative_process(spec, view);
 }
 
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {

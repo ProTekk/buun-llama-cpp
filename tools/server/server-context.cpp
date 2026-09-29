@@ -1451,6 +1451,19 @@ server_speculative_decode_terminal_resolve(
 
 struct server_slot; // forward declaration
 
+static bool server_task_can_split(const server_task & task, llama_context * ctx) {
+    // Speculative hidden-state output is not an embedding task.
+    if (!task.need_embd()) {
+        return true;
+    }
+    if (!llama_get_memory(ctx)) {
+        return false;
+    }
+    const auto pooling = llama_pooling_type(ctx);
+    return pooling == LLAMA_POOLING_TYPE_LAST ||
+        (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx));
+}
+
 struct server_batch {
     llama_batch batch;
     bool batch_rendered = false;
@@ -2753,15 +2766,9 @@ struct server_slot {
         return get_spec() && common_speculative_need_embd_nextn(get_spec());
     }
 
-    // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
-    // also we cannot split if the pooling would require any past tokens
-    // (MTP supports splitting — uses task->need_embd() not need_embd())
     bool can_split() const {
         GGML_ASSERT(task);
-
-        return
-            !task->need_embd() ||
-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+        return server_task_can_split(*task, ctx_tgt);
     }
 
     bool can_batch_with(server_slot & other_slot) const {
@@ -2902,8 +2909,9 @@ struct server_slot {
                     llama_get_memory(ctx_tgt), seq_id_backup, -1, -1);
             }
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // Child state belongs to its parent. Embedding/rerank state is
+            // stateless and must not enter idle retention or resume capture.
+            if (task->is_child() || task->need_embd()) {
                 prompt_clear();
             }
 
@@ -3351,13 +3359,24 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 // Shared block-diffusion DFlash/DSpark use one speculative object and leave
                 // the slot-owned pointer empty. Route image-batch notifications through the
                 // same accessor as text batches.
-                void * cb_data = slot.get_spec();
-                static auto cb = [](llama_batch batch, void * user_data) {
-                    common_speculative * spec = static_cast<common_speculative *>(user_data);
-                    if (!common_speculative_process(spec, batch)) {
-                        return 1;
+                struct callback_data {
+                    common_speculative * spec;
+                    std::vector<int32_t> n_seq_id;
+                    std::vector<llama_seq_id *> seq_id;
+                } cb_data = { slot.get_spec(), {}, {} };
+                static auto cb = [](const mtmd_helper_embd_batch * input, void * user_data) -> int32_t {
+                    auto & data = *static_cast<callback_data *>(user_data);
+                    if (!data.spec) {
+                        return 0;
                     }
-                    return 0;
+                    // Synchronous borrowed view: preserve every M-RoPE axis and
+                    // avoid copying projector output just to notify the drafter.
+                    data.n_seq_id.assign(input->n_tokens, 1);
+                    data.seq_id.assign(input->n_tokens, const_cast<llama_seq_id *>(&input->seq_id));
+                    llama_batch batch = {input->n_tokens, nullptr,
+                        const_cast<float *>(input->embd), const_cast<llama_pos *>(input->pos),
+                        data.n_seq_id.data(), data.seq_id.data(), nullptr};
+                    return common_speculative_process(data.spec, batch) ? 0 : 1;
                 };
 
                 llama_pos new_n_past; // unused for now
@@ -3371,7 +3390,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     llama_n_batch(slot.ctx_tgt),
                     &new_n_past,
                     cb,
-                    cb_data
+                    &cb_data
                 );
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
@@ -12838,6 +12857,11 @@ private:
     void prepare_prompt_tokens_for_launch(
             const server_slot & slot,
             server_task & task) {
+        // Stateless outputs require fresh rows, even if a caller explicitly
+        // requested caching. Run before any slot/host/live-prefix selection.
+        if (task.need_embd()) {
+            task.params.cache_prompt = false;
+        }
         if (task.prompt_tokens_prepared) {
             return;
         }
@@ -12972,9 +12996,7 @@ private:
             : llama_n_ubatch(ctx_tgt);
         const bool can_split = prompt_admission_geometry_for_test
             ? prompt_admission_geometry_for_test->can_split
-            : (!task.need_embd() ||
-               (llama_get_memory(ctx_tgt) &&
-                llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST));
+            : server_task_can_split(task, ctx_tgt);
         switch (server_slot_prompt_admission_check(
                 can_split, task.tokens.size(), n_ubatch, slot.n_ctx)) {
             case server_slot_prompt_admission::batch_too_large:
@@ -14534,7 +14556,7 @@ private:
             res->is_begin = true;
         } else {
             res->content = tkn.text_to_send;
-            res->tokens  = { tkn.tok };
+            res->tokens.assign(1, tkn.tok);
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -20215,7 +20237,9 @@ private:
                             const size_t n_content_lcp =
                                 slot.prompt.tokens.get_common_prefix(input_tokens);
 
-                            if (slot.task->params.cache_prompt) {
+                            const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
+
+                            if (slot.task->params.cache_prompt && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = (int) n_content_lcp;
 
@@ -22344,8 +22368,12 @@ private:
             }
         }
 
-        // Ensure causal attention is on for prompt eval (diffusion draft toggles it off)
-        llama_set_causal_attn(ctx_tgt, true);
+        // Diffusion drafting toggles this for generation. Stateless embedding
+        // and rerank tasks must retain the context's configured attention mode.
+        const bool stateless = batch.slot_batched && batch.slot_batched->task->need_embd();
+        if (!stateless) {
+            llama_set_causal_attn(ctx_tgt, true);
+        }
 
         bool has_output = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
@@ -22370,7 +22398,7 @@ private:
 
             t_verify_elapsed = ggml_time_us() - t_verify_start;
 
-            if (ret == 0 && spec) {
+            if (ret == 0 && spec && !stateless) {
                 try {
                     speculative_ok = common_speculative_process(
                         spec.get(), batch_view);
@@ -26002,7 +26030,7 @@ void server_routes::init_routes() {
             return res;
         }
         if (!server_cache_plan_preflight_exposure_allowed(
-                params.hostname, params.api_keys.size())) {
+                params.hostnames, params.api_keys.size())) {
             res->error(format_error_response(
                 "Cache-plan preflight requires a trusted-local single-principal server",
                 ERROR_TYPE_NOT_SUPPORTED));
@@ -26423,7 +26451,7 @@ void server_routes::init_routes() {
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_OAI_CHAT);
+        return handle_count_tokens(req, TASK_RESPONSE_TYPE_OAI_CHAT);
     };
 
     this->post_control = [this](const server_http_req & req) {
@@ -26482,7 +26510,7 @@ void server_routes::init_routes() {
     };
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_OAI_RESP);
+        return handle_count_tokens(req, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -26532,7 +26560,7 @@ void server_routes::init_routes() {
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
-        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, ctx_server.init_opt, req, TASK_RESPONSE_TYPE_ANTHROPIC);
+        return handle_count_tokens(req, TASK_RESPONSE_TYPE_ANTHROPIC);
     };
 
     // same with handle_chat_completions, but without inference part
@@ -27027,7 +27055,27 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+    // same shapes as tokenize_input_prompts(), plus OAI content: { "content": [ { "type": "text"|"image_url"|"input_audio"|"input_video", ... } ] }
+    auto tokenize_entry = [&](const json & p) {
+        if (p.is_object() && p.contains("content")) {
+            return tokenize_oai_content_array(ctx_server.vocab, ctx_server.mctx, meta->chat_params, p.at("content"), true, true, ctx_server.init_opt);
+        }
+        return tokenize_input_subprompt(ctx_server.vocab, ctx_server.mctx, p, true, true, ctx_server.init_opt);
+    };
+
+    std::vector<server_tokens> tokenized_prompts;
+    if (prompt.is_array() && !json_is_array_and_contains_numbers(prompt)) {
+        for (const auto & p : prompt) {
+            tokenized_prompts.push_back(tokenize_entry(p));
+        }
+    } else {
+        tokenized_prompts.push_back(tokenize_entry(prompt));
+    }
+    if (tokenized_prompts.empty()) {
+        res->error(format_error_response("\"input\" must not be empty", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {
@@ -27088,7 +27136,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type) {
+std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const server_http_req & req, task_response_type res_type) {
     auto res = create_response();
     std::vector<raw_buffer> files;
     json body = json::parse(req.body);
@@ -27122,13 +27170,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
 
     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
     size_t n_tokens;
-    if (mctx != nullptr) {
+    if (ctx_server.mctx != nullptr) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt, true).size();
+        n_tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt, true).size();
     } else {
-        n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
+        n_tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true).size();
     }
 
     json response = {{"input_tokens", static_cast<int64_t>(n_tokens)}};
