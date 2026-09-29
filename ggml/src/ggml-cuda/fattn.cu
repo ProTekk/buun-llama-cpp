@@ -409,13 +409,14 @@ static int ggml_cuda_q8_turbo3_mma_min_q() {
     return value;
 }
 
-// largest query width routed to the fused q8_0-K MMA paths (valid 5..8). Default 5: MTP depth
-// 3/4 verify widths; the (8,8) instance covers widths 6..8 when set to 8.
+// largest query width routed to the fused q8_0-K MMA paths (valid 5..8). Default 8: the
+// (8,8) eight-row tile instance covers the full MTP verify range (width 5) and DFlash2's
+// block_size 8 verify (widths 6..8) instead of the generic mma_f16 dequant path.
 static int ggml_cuda_q8_turbo3_mma_max_q() {
     static const int value = [] {
         const char * env = getenv("GGML_Q8_TURBO3_MMA_MAX_Q");
-        const int v = env ? atoi(env) : 5;
-        return (v >= 5 && v <= 8) ? v : 5;
+        const int v = env ? atoi(env) : 8;
+        return (v >= 5 && v <= 8) ? v : 8;
     }();
     return value;
 }
@@ -2928,7 +2929,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
             if (V->type == GGML_TYPE_TURBO3_0) {
                 if (Q->ne[1] >= 5) {
-                    // width 5 (MTP depth-4 verify pad): the (8,8) full eight-row tile instance
+                    // widths 5..8 (MTP depth-4 verify pad, DFlash2 block 8): the (8,8)
+                    // full eight-row tile instance
                     ggml_cuda_flash_attn_ext_mma_turbo_case<256, 256, 8, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
                 } else {
                     ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
