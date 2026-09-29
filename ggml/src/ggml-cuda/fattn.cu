@@ -385,6 +385,52 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 }
 
+// Env knobs for the fused Q8_0-K MMA path (defined before the turbo dispatch templates below).
+
+// Fused Q8_0-K / turbo3-V (and Q8_0/Q8_0) MMA path. Default ON: K is read directly from the
+// q8_0 cache and V from the turbo3 cache, dequanted into the shmem tile inside the MMA kernel.
+// Set GGML_Q8_TURBO3_MMA_FUSED=0 to fall back to the dequant-to-f16 routes.
+static bool ggml_cuda_q8_turbo3_mma_fused() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_Q8_TURBO3_MMA_FUSED");
+        if (env) fprintf(stderr, "GGML_Q8_TURBO3_MMA_FUSED=%s\n", env);
+        return env == nullptr || env[0] != '0';
+    }();
+    return value;
+}
+
+// smallest query width routed to the fused q8_0-K MMA paths (valid 1..5).
+static int ggml_cuda_q8_turbo3_mma_min_q() {
+    static const int value = [] {
+        const char * env = getenv("GGML_Q8_TURBO3_MMA_MIN_Q");
+        const int v = env ? atoi(env) : 1;
+        return (v >= 1 && v <= 5) ? v : 1;
+    }();
+    return value;
+}
+
+// largest query width routed to the fused q8_0-K MMA paths (valid 5..8). Default 5: MTP depth
+// 3/4 verify widths; the (8,8) instance covers widths 6..8 when set to 8.
+static int ggml_cuda_q8_turbo3_mma_max_q() {
+    static const int value = [] {
+        const char * env = getenv("GGML_Q8_TURBO3_MMA_MAX_Q");
+        const int v = env ? atoi(env) : 5;
+        return (v >= 5 && v <= 8) ? v : 5;
+    }();
+    return value;
+}
+
+// pads single queries into the (2,8) fused instance (valid 1, 2, 4). The (1,8) instance runs
+// few blocks at low occupancy; the padded route launches more blocks at the same cost class.
+static int ggml_cuda_q8_turbo3_mma_ncols1_min() {
+    static const int value = [] {
+        const char * env = getenv("GGML_Q8_TURBO3_MMA_NCOLS1_MIN");
+        const int v = env ? atoi(env) : 2;
+        return (v == 1 || v == 2 || v == 4) ? v : 2;
+    }();
+    return value;
+}
+
 #if defined(GGML_CUDA_TURBO_FA)
 // Turbo MMA fused dispatch: ncols1 selection for the <= 4-token decode path.
 template <int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
@@ -394,6 +440,16 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1(ggml_backend_cuda_c
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+            // q8_0-K fused pair: a single query may be padded into the (2, ncols2) tile
+            // (GGML_Q8_TURBO3_MMA_NCOLS1_MIN, default 2): the (1, ncols2) instance runs few
+            // blocks at low occupancy, the padded route launches more blocks for free (the
+            // mask covers the pad rows). Only (2, 8) is a compiled (256, 256) config.
+            if constexpr (ncols2 == 8) {
+                if (type_K == GGML_TYPE_Q8_0 && Q->ne[1] == 1) {
+                    const int n1_min = ggml_cuda_q8_turbo3_mma_ncols1_min();
+                    if (n1_min == 2) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 2, ncols2, type_K, type_V>(ctx, dst); return; }
+                }
+            }
             ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8/ncols2, ncols2, type_K, type_V>(ctx, dst);
             return;
         }
@@ -2861,6 +2917,33 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     };
     const bool turbo_fused_asym = turbo_fused_asym_pair(K->type, V->type) && Q->ne[0] == 256 &&
         (t1_fused_ok || (K->type != GGML_TYPE_TURBO1_TCQ && V->type != GGML_TYPE_TURBO1_TCQ));
+    // Fused Q8_0-K MMA: K is read directly from the q8_0 cache (no full-cache dequant; q8_0 K
+    // is unrotated, so Q must NOT be WHT-rotated) and V from the turbo3 or q8_0 cache, both
+    // dequanted into the shmem tile inside the kernel. D=256 decode/verify widths only (see
+    // the knobs above); everything else falls through to the dequant routes below.
+    {
+        const bool q8_k_fused = K->type == GGML_TYPE_Q8_0 && (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_Q8_0);
+        if (ggml_cuda_q8_turbo3_mma_fused() && q8_k_fused && Q->ne[0] == 256 && V->ne[0] == 256 &&
+            Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= ggml_cuda_q8_turbo3_mma_max_q() &&
+            turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            if (V->type == GGML_TYPE_TURBO3_0) {
+                if (Q->ne[1] >= 5) {
+                    // width 5 (MTP depth-4 verify pad): the (8,8) full eight-row tile instance
+                    ggml_cuda_flash_attn_ext_mma_turbo_case<256, 256, 8, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
+                }
+            } else {
+                if (Q->ne[1] >= 5) {
+                    ggml_cuda_flash_attn_ext_mma_turbo_case<256, 256, 8, 8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                }
+            }
+            return;
+        }
+    }
+
 #if defined(GGML_CUDA_TURBO_FA)
     if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
@@ -2894,10 +2977,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // rotated once to match. Only V is decoded to the original domain inside the loader.
         ggml_tensor Q_rot_fused;
         ggml_tensor * orig_q_fused = nullptr;
-        // f16 K is stored in the ORIGINAL (unrotated) domain, so Q must NOT be WHT-rotated for it
-        // (rotated-Q . unrotated-K would be wrong). Turbo K is stored rotated → rotate Q to match.
-        // Only K drives Q rotation; V is always decoded to the original domain inside the loader.
-        const bool fused_k_original_domain = (K->type == GGML_TYPE_F16);
+        // f16 K and q8_0 K are stored in the ORIGINAL (unrotated) domain, so Q must NOT be
+        // WHT-rotated for them (rotated-Q . unrotated-K would be wrong). Turbo K is stored
+        // rotated → rotate Q to match. Only K drives Q rotation; V is always decoded to the
+        // original domain inside the loader.
+        const bool fused_k_original_domain = (K->type == GGML_TYPE_F16) || (K->type == GGML_TYPE_Q8_0);
         if (!fused_k_original_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             q_rot_buf_ensure(ctx, q_size);

@@ -12885,6 +12885,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen3.8-27B decode attention shape (4 KV heads x GQA 6, D=256, q8_0 K / turbo3 V) at short and long KV.
+    // Widths 1-5 run the fused q8_0-K path; 7/8 need GGML_Q8_TURBO3_MMA_MAX_Q=8 (the (8,8) instance) and
+    // fall to the vector path at the default.
+    for (int64_t kv : {4096, 100352}) {
+        for (int nb : {1, 2, 4, 5, 7, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+    // the same D=256 pairs in the KV-cache layout (heads interleaved per token: the rows of heads 1..3 are
+    // only 4-byte aligned, unlike the per-head-contiguous default layout above)
+    for (int64_t kv : {4096, 100352}) {
+        for (int nb : {1, 2, 4, 5, 7, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        }
+    }
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));

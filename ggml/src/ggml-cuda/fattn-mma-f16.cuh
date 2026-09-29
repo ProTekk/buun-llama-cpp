@@ -823,6 +823,61 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
     }
 }
 
+// bit-cast helpers for the conversion-free q8_0 tile loader
+static __device__ __forceinline__ half2 ggml_cuda_u32_as_half2(const uint32_t x) {
+    half2 r; memcpy(&r, &x, sizeof(r)); return r;
+}
+
+// Q8_0 tile loader for the fused mixed-KV MMA path (conversion-free).
+// Each lane decodes eight consecutive values (four half2) per iteration and writes one
+// 8-byte-aligned chunk (no tile swizzling in this tree, so 16B stores are not guaranteed
+// by the +4 row padding). int8 -> half is done without I2F: the byte is XORed with 0x80
+// (u = q+128, 0..255) and placed in the low byte of an fp16 word whose high byte is 0x64,
+// which is exactly 1024+u in fp16 (ulp is 1 on [1024,2048)); subtracting 1152 (0x6480) is
+// exact and gives q. The final d*q multiply is the same __hmul2 as the f16 dequant path, so
+// the tile is bit-identical to d2 * make_half2(q0, q1).
+template<int stride_tile, int nbatch_fa, int nthreads, int D2, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_q8_0_load_tile(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int stride_bytes, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    constexpr int half2_per_chunk = 4;
+    static_assert(D2 % half2_per_chunk == 0, "D2 must be a multiple of 4");
+    constexpr int chunks_per_row = D2 / half2_per_chunk;
+    constexpr int nchunks = nbatch_fa * chunks_per_row;
+
+    const half2 bias = ggml_cuda_u32_as_half2(0x6480u | (0x6480u << 16));
+
+    for (int linear = tid; linear < nchunks; linear += nthreads) {
+        const int row = linear / chunks_per_row;
+        const int col = (linear - row * chunks_per_row) * half2_per_chunk;
+        if (oob_check && row >= i_sup) {
+            for (int c = 0; c < half2_per_chunk; ++c) {
+                tile_KV[row * stride_tile + col + c] = make_half2(0.0f, 0.0f);
+            }
+            continue;
+        }
+
+        const int i0 = 2 * col; // first of eight values, 8-aligned so inside one block
+        const block_q8_0 & block = ((const block_q8_0 *) (KV_raw + (int64_t) row * stride_bytes))[i0 / QK8_0];
+        const int iq = i0 % QK8_0;
+        const half2 d2 = __half2half2(block.d);
+        // block.qs + iq is 2-byte aligned (sizeof(block_q8_0) == 34, iq even)
+        const uint16_t * qp = (const uint16_t *) (block.qs + iq);
+        const uint32_t w0 = __byte_perm((uint32_t) qp[0], (uint32_t) qp[1], 0x5410) ^ 0x80808080u; // q0..q3 + 128
+        const uint32_t w1 = __byte_perm((uint32_t) qp[2], (uint32_t) qp[3], 0x5410) ^ 0x80808080u; // q4..q7 + 128
+        const uint32_t p0 = __byte_perm(w0, 0x64646464u, 0x5140); // (1024+q0..q3) high/low bytes
+        const uint32_t p1 = __byte_perm(w0, 0x64646464u, 0x7362);
+        const uint32_t p2 = __byte_perm(w1, 0x64646464u, 0x5140);
+        const uint32_t p3 = __byte_perm(w1, 0x64646464u, 0x7362);
+        tile_KV[row * stride_tile + col + 0] = d2 * __hsub2(ggml_cuda_u32_as_half2(p0), bias);
+        tile_KV[row * stride_tile + col + 1] = d2 * __hsub2(ggml_cuda_u32_as_half2(p1), bias);
+        tile_KV[row * stride_tile + col + 2] = d2 * __hsub2(ggml_cuda_u32_as_half2(p2), bias);
+        tile_KV[row * stride_tile + col + 3] = d2 * __hsub2(ggml_cuda_u32_as_half2(p3), bias);
+    }
+}
+
 static __device__ __forceinline__ float fwht128_butterfly_linear(float val, float * smem, const int tid) {
 #pragma unroll
     for (int h = 1; h <= 16; h *= 2) {
@@ -964,7 +1019,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo8_load_tile<DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>(
                     K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
+            } else if constexpr (type_K == GGML_TYPE_Q8_0) {
+                // conversion-free q8_0 K: raw cache bytes dequanted in-tile (no I2F)
+                const char * K_raw = (const char *)K_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_q8_0_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, DKQ/2, oob_check>(
+                    K_raw + int64_t(k_VKQ_0) * stride_K, tile_K, stride_K, k_VKQ_sup);
             } else {
+                static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO8_0 || type_K == GGML_TYPE_Q8_0 ||
+                    type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 ||
+                    type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ || type_K == GGML_TYPE_TURBO1_TCQ,
+                    "only q8_0, turbo1-4 and TCQ K supported on the compressed MMA path");
                 const char * K_raw = (const char *)K_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo_load_tile<type_K, DKQ, stride_tile_K, nbatch_fa, nthreads_turbo, oob_check, false>(
@@ -1340,7 +1405,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo8_load_tile<DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>(
                     V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
                 __syncthreads();
+            } else if constexpr (type_V == GGML_TYPE_Q8_0) {
+                // conversion-free q8_0 V: raw cache bytes dequanted in-tile (no I2F)
+                const char * V_raw = (const char *)V_h2;
+                constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
+                flash_attn_ext_q8_0_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, DV/2, oob_check>(
+                    V_raw + int64_t(k_VKQ_0) * stride_V, tile_V, stride_V, k_VKQ_sup);
+                __syncthreads();
             } else {
+                static_assert(type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO8_0 || type_V == GGML_TYPE_Q8_0 ||
+                    type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 ||
+                    type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ,
+                    "only q8_0, turbo1-4 and TCQ V supported on the MMA turbo path");
                 const char * V_raw = (const char *)V_h2;
                 constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
                 flash_attn_ext_turbo_load_tile<type_V, DV, stride_tile_V, nbatch_fa, nthreads_turbo, oob_check, true>(
