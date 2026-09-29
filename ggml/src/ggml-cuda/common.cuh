@@ -1687,6 +1687,19 @@ struct ggml_backend_cuda_context {
     // packer, which applies the same reduction while writing BF16 directly.
     // Entries are produced and consumed within one graph evaluation.
     std::unordered_set<const void *> gdn_deferred_l2;
+    // gated_delta_net nodes of the graph being evaluated whose GET_ROWS state gather is skipped:
+    // the launch reads sequence s's input state from base + rows[s] * D instead of src[5].
+    // Filled by ggml_cuda_gdn_state_read_plan at the start of each evaluation, cleared at its end.
+    struct gdn_state_read_entry {
+        const ggml_tensor * gdn        = nullptr;
+        const float *       base       = nullptr;
+        const int32_t *     rows       = nullptr;
+        int64_t             row_stride = 0;       // floats (always D for the shapes matched)
+        bool                used       = false;
+    };
+    std::vector<gdn_state_read_entry> gdn_state_reads;
+    // cumulative launches that read the state through the cache rows (test visibility)
+    int64_t gdn_state_read_count = 0;
     std::unordered_map<const ggml_tensor *, ggml_cuda_humming_prepared_activation> humming_prepared_activations;
     std::unordered_set<const ggml_tensor *> humming_prepared_active;
 
