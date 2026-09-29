@@ -4055,6 +4055,17 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
+        // bounded f16 prefill runs a group loop with pool/reserved scratch and asserts it is not
+        // captured: a graph holding such a node always runs eagerly. With GGML_CUDA_PREFILL_KV_MIB=0
+        // / off the check returns at once.
+        if (node->op == GGML_OP_FLASH_ATTN_EXT &&
+                ggml_cuda_flash_attn_ext_bounded_prefill_applies(ggml_cuda_get_device(), node)) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to bounded fattn prefill\n", __func__);
+#endif
+        }
+
         if (!use_cuda_graph) {
             break;
         }
@@ -8636,6 +8647,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+        } else {
+            // graph incompatible (e.g. a bounded fattn prefill node, which asserts it is not
+            // captured): fall through to the eager path with the same result.
+            GGML_LOG_DEBUG("%s: CUDA graph incompatible with this batch; running eagerly\n", __func__);
         }
     }
 #endif // USE_CUDA_GRAPH
