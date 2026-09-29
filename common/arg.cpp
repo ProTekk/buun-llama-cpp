@@ -2624,6 +2624,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_VBR_ANCHOR_CACHE_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-path"}, "DIR",
+        "spill parked host prompt-cache conversations to DIR so they survive a restart "
+        "(default: '', the disk tier is off)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-limit-mib"}, "N",
+        string_format("limit the --cache-disk-path tier to N MiB of objects (default: %d, 0 - unlimited)", params.cache_disk_limit_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-limit-mib must be non-negative");
+            }
+            params.cache_disk_limit_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

@@ -955,6 +955,11 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    // Prompt-cache disk tier (P4): parked host-prompt-cache conversations spill to this
+    // directory so they survive a server restart. Empty = the tier is off.
+    std::string cache_disk_path;
+    // Byte limit for the disk tier; 0 = unlimited.
+    int32_t cache_disk_limit_mib = 0;
     bool        resume = false; // save the slots' conversations at shutdown and sleep, restore them at startup and wake
     std::string resume_path;    // root of the resume store, empty: the cache directory
     bool        resume_no_host_cache = false; // save and restore the slots only, not the host prompt cache

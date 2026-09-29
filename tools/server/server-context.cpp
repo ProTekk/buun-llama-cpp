@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-cache-authority.h"
+#include "server-cache-disk.h"
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-plan-preflight-internal.h"
@@ -439,6 +440,27 @@ std::string server_resume_hex(const uint8_t * data, size_t size) {
         out.push_back(digits[data[i] & 15]);
     }
     return out;
+}
+
+// Producer identity for the prompt-cache disk tier: what the parked state bytes depend on and
+// nothing else. It reuses the resume-compat key — the same model/runtime contract a saved
+// conversation must match to restore — plus the format version. Objects written under a
+// different identity are a foreign model or cache configuration and are dropped at scan time.
+std::string server_cache_disk_producer_identity(
+        const llama_model * model,
+        const common_params & params) {
+    if (!model) {
+        return std::string();
+    }
+    const auto key = server_resume_key_build(model, params);
+    if (!key.family_compatible) {
+        return std::string();
+    }
+    llama_sha256_writer writer;
+    static constexpr char domain[] = "buun.server.cache-disk-producer/v1";
+    writer.string(domain, sizeof(domain) - 1);
+    writer.bytes(key.digest.data(), key.digest.size());
+    return server_resume_hex(writer.finish().data(), 32);
 }
 
 // SHA-256, domain buun.server.resume-prefix/v1, over the ledger's token ids [0, p) as LE u32.
@@ -10904,6 +10926,16 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            if (!params_base.cache_disk_path.empty()) {
+                const auto producer_identity = server_cache_disk_producer_identity(model_tgt, params_base);
+                if (producer_identity.empty()) {
+                    SRV_WRN("%s", "prompt cache disk tier disabled: model identity is not buildable\n");
+                } else {
+                    const uint64_t limit_bytes = params_base.cache_disk_limit_mib <= 0
+                        ? 0 : uint64_t(params_base.cache_disk_limit_mib)*1024*1024;
+                    prompt_cache->set_cache_disk_tier(params_base.cache_disk_path, producer_identity, limit_bytes);
+                }
+            }
             if (params_base.vbr_prompt_cache &&
                 params_base.vbr_anchor_cache_mib > 0) {
                 const uint64_t anchor_bytes =
