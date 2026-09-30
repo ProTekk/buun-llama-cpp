@@ -2979,8 +2979,26 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
+    // Matched turbo4/turbo4 D=256 verify widths 5..8 (MTP depth-4 verify pad, DFlash2 block 8):
+    // an (8,8) full-tile fused instance exists (mirrors the q8_0-K routing above and llamAmpere's
+    // (8,8) verify kernels). Without it every width-5+ turbo verify round falls to the O(n_kv)
+    // f16-materialize route (~0.56 ms per 1K ctx tokens measured on Qwen3.8-27B, RTX 3090) —
+    // the long-context decode regression vs llamAmpere. Native VEC is NOT an alternative at
+    // these widths: cols_per_block=2 makes it re-scan the KV per column block (measured 3x
+    // slower than the materialize route at 21K). GGML_T4_MMA_FUSED_MAX_Q=4 restores the old
+    // materialize routing for widths 5..8.
+    static const int t4_mma_fused_max_q = [] {
+        const char * e = getenv("GGML_T4_MMA_FUSED_MAX_Q");
+        if (!e) return 8;
+        const int v = atoi(e);
+        return (v >= 4 && v <= 8) ? v : 8;
+    }();
+    const bool turbo4_matched_wide = K->type == GGML_TYPE_TURBO4_0 && V->type == GGML_TYPE_TURBO4_0 &&
+        Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 5 && Q->ne[1] <= t4_mma_fused_max_q;
+
 #if defined(GGML_CUDA_TURBO_FA)
-    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
+    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) &&
+        (Q->ne[1] <= 4 || turbo4_matched_wide) &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         (turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
          // AMD RDNA WMMA: trying D=128 AND D=256 (gemma) after lifting the upstream DKQ<=128 cap.
@@ -3037,6 +3055,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // it → "previous error during capture"). Keep only the once-guarded env/static setup.
         if (V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO1_TCQ) {
             load_tcq_decode_alpha(device);
+        }
+
+        // Matched turbo4 D=256 verify widths 5..8: the (8,8) full eight-row tile instance
+        // (same routing shape as the q8_0-K widths 5..8 above; Q is already pre-rotated).
+        if (turbo4_matched_wide) {
+            ggml_cuda_flash_attn_ext_mma_turbo_case<256, 256, 8, 8, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+            if (orig_q_fused) dst->src[0] = orig_q_fused;
+            return;
         }
 
 #define TURBO_FUSED_DISPATCH(tK, tV) \

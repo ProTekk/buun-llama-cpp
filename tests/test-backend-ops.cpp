@@ -13221,6 +13221,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
         }
     }
+    // NOTE: matched turbo-K pairs (e.g. TURBO4_0/TURBO4_0) cannot be swept here: the CPU
+    // reference fattn calls type_traits[K].vec_dot, which is NULL for turbo types (GPU-only
+    // codecs) — segfault in ggml_compute_forward_flash_attn_ext. The fused (8,8) matched-turbo4
+    // verify instances are validated at the server level (kill-switch A/B, greedy coherence).
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
