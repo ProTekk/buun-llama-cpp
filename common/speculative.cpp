@@ -2712,6 +2712,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
+        // Built-in-head models (no sidecar d2t): build the runtime compact 65K
+        // draft head once so every draft step scores ~272 MB of gathered head
+        // rows instead of the full-vocab LM head (~1 GB re-read per step).
+        // Idempotent; a no-op for derivative GGUFs, non-qwen35 archs, or
+        // tokenizer mismatches (LLAMA_MTP_VOCAB_MAP=0 disables).
+        llama_model_init_mtp_draft_vocab(llama_get_model(ctx_dft));
+
         // Every MTP context points at its target through ctx_other, but Qwen-family
         // MTP contexts own a separate filtered cache. Ask the memory about the cells
         // that the drafting algorithm actually depends on.
