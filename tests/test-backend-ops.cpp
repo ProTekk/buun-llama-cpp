@@ -13883,9 +13883,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
     for (int64_t kv : {4096, 16384, 32768}) {
-        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, false, 512));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  false, false, 512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, false, 2048));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -13924,6 +13924,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // turbo-compressed decode/verify pairs at the production geometry (D=256, GQA 6, kv 100352),
+    // in both the per-head-contiguous and the interleaved KV-cache layout. Perf-mode only:
+    // the CPU reference cannot handle turbo K (vec_dot NULL), but perf needs no reference.
+    for (int nb : {1, 2, 4, 5, 8}) {
+        for (auto kvp : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+                {GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
+                {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100352, nb, true, false, 0, 0, GGML_PREC_F32, kvp.first, kvp.second));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100352, nb, true, false, 0, 0, GGML_PREC_F32, kvp.first, kvp.second, {0, 2, 1, 3}));
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 576, }) {
