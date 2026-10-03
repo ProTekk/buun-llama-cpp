@@ -56,6 +56,7 @@ public:
     }
 
 private:
+    int maximum_depth;
     int minimum_depth;
     int maximum_depth;
     int cap;
